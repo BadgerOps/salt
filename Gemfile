@@ -1,9 +1,10 @@
 # This file is only used for running the test suite with kitchen-salt.
 
-source "https://rubygems.org"
+source 'https://rubygems.org'
 
-gem "test-kitchen"
-gem "kitchen-salt", :git => 'https://github.com/saltstack/kitchen-salt.git'
+gem 'test-kitchen', :git => 'https://github.com/test-kitchen/test-kitchen.git'
+gem 'kitchen-salt', :git => 'https://github.com/saltstack/kitchen-salt.git'
+gem 'kitchen-sync'
 gem 'git'
 
 group :docker do
@@ -20,4 +21,8 @@ group :windows do
   gem 'kitchen-vagrant'
   gem 'winrm', '~>2.0'
   gem 'winrm-fs', '~>1.0'
+end
+
+group :ec2 do
+  gem 'kitchen-ec2'
 end

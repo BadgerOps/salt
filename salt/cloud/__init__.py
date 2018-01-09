@@ -36,6 +36,8 @@ import salt.utils.crypt
 import salt.utils.data
 import salt.utils.dictupdate
 import salt.utils.files
+import salt.utils.verify
+import salt.utils.yaml
 import salt.syspaths
 from salt.template import compile_template
 
@@ -47,7 +49,6 @@ except ImportError:
         import Crypto.Random
     except ImportError:
         pass  # pycrypto < 2.1
-import yaml
 from salt.ext import six
 from salt.ext.six.moves import input  # pylint: disable=import-error,redefined-builtin
 
@@ -184,6 +185,10 @@ class CloudClient(object):
             self.opts = opts
         else:
             self.opts = salt.config.cloud_config(path)
+
+        # Check the cache-dir exists. If not, create it.
+        v_dirs = [self.opts['cachedir']]
+        salt.utils.verify.verify_env(v_dirs, salt.utils.get_user())
 
         if pillars:
             for name, provider in six.iteritems(pillars.pop('providers', {})):
@@ -666,7 +671,7 @@ class Cloud(object):
                 # If driver has function list_nodes_min, just replace it
                 # with query param to check existing vms on this driver
                 # for minimum information, Otherwise still use query param.
-                if 'selected_query_option' not in opts and '{0}.list_nodes_min'.format(driver) in self.clouds:
+                if opts.get('selected_query_option') is None and '{0}.list_nodes_min'.format(driver) in self.clouds:
                     this_query = 'list_nodes_min'
 
                 fun = '{0}.{1}'.format(driver, this_query)
@@ -1388,7 +1393,7 @@ class Cloud(object):
 
         try:
             with salt.utils.files.fopen(self.opts['conf_file'], 'r') as mcc:
-                main_cloud_config = yaml.safe_load(mcc)
+                main_cloud_config = salt.utils.yaml.safe_load(mcc)
             if not main_cloud_config:
                 main_cloud_config = {}
         except KeyError:

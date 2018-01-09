@@ -83,10 +83,12 @@ import shutil
 import logging
 import sys
 import tempfile
+from pkg_resources import parse_version
 
 # Import Salt libs
 import salt.utils.data
 import salt.utils.files
+import salt.utils.json
 import salt.utils.locales
 import salt.utils.platform
 import salt.utils.url
@@ -1132,6 +1134,13 @@ def list_upgrades(bin_env=None,
 
     cmd = [pip_bin, 'list', '--outdated']
 
+    # If pip >= 9.0 use --format=json
+    min_version = '9.0'
+    cur_version = version(pip_bin)
+    if salt.utils.versions.compare(ver1=cur_version, oper='>=',
+                                       ver2=min_version):
+        cmd.append('--format=json')
+
     cmd_kwargs = dict(cwd=cwd, runas=user)
     if bin_env and os.path.isdir(bin_env):
         cmd_kwargs['env'] = {'VIRTUAL_ENV': bin_env}
@@ -1142,15 +1151,76 @@ def list_upgrades(bin_env=None,
         raise CommandExecutionError(result['stderr'])
 
     packages = {}
-    for line in result['stdout'].splitlines():
-        match = re.search(r'(\S*)\s+\(.*Latest:\s+(.*)\)', line)
-        if match:
-            name, version_ = match.groups()
+    try:
+        json_results = salt.utils.json.loads(result['stdout'])
+        for json_result in json_results:
+            packages[json_result['name']] = json_result['latest_version']
+    except ValueError:
+        for line in result['stdout'].splitlines():
+            match = re.search(r'(\S*)\s+.*Latest:\s+(.*)', line)
+            if match:
+                name, version_ = match.groups()
+            else:
+                logger.error('Can\'t parse line \'{0}\''.format(line))
+                continue
+            packages[name] = version_
+
+    return packages
+
+
+def is_installed(pkgname=None,
+          bin_env=None,
+          user=None,
+          cwd=None):
+    '''
+    Filter list of installed apps from ``freeze`` and return True or False  if
+    ``pkgname`` exists in the list of packages installed.
+
+    .. note::
+
+        If the version of pip available is older than 8.0.3, the packages
+        wheel, setuptools, and distribute will not be reported by this function
+        even if they are installed. Unlike
+        :py:func:`pip.freeze <salt.modules.pip.freeze>`, this function always
+        reports the version of pip which is installed.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' pip.is_installed salt
+
+    .. versionadded:: Oxygen
+
+        The packages wheel, setuptools, and distribute are included if the
+        installed pip is new enough.
+    '''
+    for line in freeze(bin_env=bin_env, user=user, cwd=cwd):
+        if line.startswith('-f') or line.startswith('#'):
+            # ignore -f line as it contains --find-links directory
+            # ignore comment lines
+            continue
+        elif line.startswith('-e hg+not trust'):
+            # ignore hg + not trust problem
+            continue
+        elif line.startswith('-e'):
+            line = line.split('-e ')[1]
+            version_, name = line.split('#egg=')
+        elif len(line.split('===')) >= 2:
+            name = line.split('===')[0]
+            version_ = line.split('===')[1]
+        elif len(line.split('==')) >= 2:
+            name = line.split('==')[0]
+            version_ = line.split('==')[1]
         else:
             logger.error('Can\'t parse line \'{0}\''.format(line))
             continue
-        packages[name] = version_
-    return packages
+
+        if pkgname:
+            if pkgname == name.lower():
+                return True
+
+    return False
 
 
 def upgrade_available(pkg,
@@ -1219,3 +1289,79 @@ def upgrade(bin_env=None,
     ret['changes'] = salt.utils.data.compare_dicts(old, new)
 
     return ret
+
+
+def list_all_versions(pkg,
+                      bin_env=None,
+                      include_alpha=False,
+                      include_beta=False,
+                      include_rc=False,
+                      user=None,
+                      cwd=None):
+    '''
+    .. versionadded:: 2017.7.3
+
+    List all available versions of a pip package
+
+    pkg
+        The package to check
+
+    bin_env
+        Path to pip bin or path to virtualenv. If doing a system install,
+        and want to use a specific pip bin (pip-2.7, pip-2.6, etc..) just
+        specify the pip bin you want.
+
+    include_alpha
+        Include alpha versions in the list
+
+    include_beta
+        Include beta versions in the list
+
+    include_rc
+        Include release candidates versions in the list
+
+    user
+        The user under which to run pip
+
+    cwd
+        Current working directory to run pip from
+
+    CLI Example:
+
+    .. code-block:: bash
+
+       salt '*' pip.list_all_versions <package name>
+    '''
+    pip_bin = _get_pip_bin(bin_env)
+
+    cmd = [pip_bin, 'install', '{0}==versions'.format(pkg)]
+
+    cmd_kwargs = dict(cwd=cwd, runas=user, output_loglevel='quiet', redirect_stderr=True)
+    if bin_env and os.path.isdir(bin_env):
+        cmd_kwargs['env'] = {'VIRTUAL_ENV': bin_env}
+
+    result = __salt__['cmd.run_all'](cmd, **cmd_kwargs)
+
+    filtered = []
+    if not include_alpha:
+        filtered.append('a')
+    if not include_beta:
+        filtered.append('b')
+    if not include_rc:
+        filtered.append('rc')
+    if filtered:
+        excludes = re.compile(r'^((?!{0}).)*$'.format('|'.join(filtered)))
+    else:
+        excludes = re.compile(r'')
+
+    versions = []
+    for line in result['stdout'].splitlines():
+        match = re.search(r'\s*Could not find a version.* \(from versions: (.*)\)', line)
+        if match:
+            versions = [v for v in match.group(1).split(', ') if v and excludes.match(v)]
+            versions.sort(key=parse_version)
+            break
+    if not versions:
+        return None
+
+    return versions

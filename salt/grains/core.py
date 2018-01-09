@@ -425,14 +425,14 @@ def _osx_memdata():
     sysctl = salt.utils.path.which('sysctl')
     if sysctl:
         mem = __salt__['cmd.run']('{0} -n hw.memsize'.format(sysctl))
-        swap_total = __salt__['cmd.run']('{0} -n vm.swapusage').split()[2]
+        swap_total = __salt__['cmd.run']('{0} -n vm.swapusage'.format(sysctl)).split()[2]
         if swap_total.endswith('K'):
             _power = 2**10
         elif swap_total.endswith('M'):
             _power = 2**20
         elif swap_total.endswith('G'):
             _power = 2**30
-        swap_total = swap_total[:-1] * _power
+        swap_total = float(swap_total[:-1]) * _power
 
         grains['mem_total'] = int(mem) // 1024 // 1024
         grains['swap_total'] = int(swap_total) // 1024 // 1024
@@ -474,8 +474,14 @@ def _sunos_memdata():
             grains['mem_total'] = int(comps[2].strip())
 
     swap_cmd = salt.utils.path.which('swap')
-    swap_total = __salt__['cmd.run']('{0} -s'.format(swap_cmd)).split()[1]
-    grains['swap_total'] = int(swap_total) // 1024
+    swap_data = __salt__['cmd.run']('{0} -s'.format(swap_cmd)).split()
+    try:
+        swap_avail = int(swap_data[-2][:-1])
+        swap_used = int(swap_data[-4][:-1])
+        swap_total = (swap_avail + swap_used) // 1024
+    except ValueError:
+        swap_total = None
+    grains['swap_total'] = swap_total
     return grains
 
 
@@ -805,11 +811,13 @@ def _virtual(osdata):
         if os.path.isfile('/proc/1/cgroup'):
             try:
                 with salt.utils.files.fopen('/proc/1/cgroup', 'r') as fhr:
-                    if ':/lxc/' in fhr.read():
-                        grains['virtual_subtype'] = 'LXC'
-                with salt.utils.files.fopen('/proc/1/cgroup', 'r') as fhr:
                     fhr_contents = fhr.read()
-                    if ':/docker/' in fhr_contents or ':/system.slice/docker' in fhr_contents:
+                if ':/lxc/' in fhr_contents:
+                    grains['virtual_subtype'] = 'LXC'
+                else:
+                    if any(x in fhr_contents
+                           for x in (':/system.slice/docker', ':/docker/',
+                                     ':/docker-ce/')):
                         grains['virtual_subtype'] = 'Docker'
             except IOError:
                 pass
@@ -1476,6 +1484,9 @@ def os_data():
                         grains['init'] = 'supervisord'
                     elif init_cmdline == ['runit']:
                         grains['init'] = 'runit'
+                    elif '/sbin/my_init' in init_cmdline:
+                        #Phusion Base docker container use runit for srv mgmt, but my_init as pid1
+                        grains['init'] = 'runit'
                     else:
                         log.info(
                             'Could not determine init system from command line: ({0})'
@@ -1877,6 +1888,33 @@ def append_domain():
     if 'append_domain' in __opts__:
         grain['append_domain'] = __opts__['append_domain']
     return grain
+
+
+def fqdns():
+    '''
+    Return all known FQDNs for the system by enumerating all interfaces and
+    then trying to reverse resolve them (excluding 'lo' interface).
+    '''
+    # Provides:
+    # fqdns
+
+    grains = {}
+    fqdns = set()
+
+    addresses = salt.utils.network.ip_addrs(include_loopback=False,
+        interface_data=_INTERFACES)
+    addresses.extend(salt.utils.network.ip_addrs6(include_loopback=False,
+        interface_data=_INTERFACES))
+
+    for ip in addresses:
+        try:
+            fqdns.add(socket.gethostbyaddr(ip)[0])
+        except (socket.error, socket.herror,
+            socket.gaierror, socket.timeout) as e:
+            log.error("Exception during resolving address: " + str(e))
+
+    grains['fqdns'] = list(fqdns)
+    return grains
 
 
 def ip_fqdn():
@@ -2475,10 +2513,9 @@ def _linux_iqn():
     if os.path.isfile(initiator):
         with salt.utils.files.fopen(initiator, 'r') as _iscsi:
             for line in _iscsi:
-                if line.find('InitiatorName') != -1:
-                    iqn = line.split('=')
-                    final_iqn = iqn[1].rstrip()
-                    ret.extend([final_iqn])
+                line = line.strip()
+                if line.startswith('InitiatorName='):
+                    ret.append(line.split('=', 1)[1])
     return ret
 
 
@@ -2492,9 +2529,10 @@ def _aix_iqn():
 
     aixret = __salt__['cmd.run'](aixcmd)
     if aixret[0].isalpha():
-        iqn = aixret.split()
-        final_iqn = iqn[1].rstrip()
-        ret.extend([final_iqn])
+        try:
+            ret.append(aixret.split()[1].rstrip())
+        except IndexError:
+            pass
     return ret
 
 
@@ -2507,8 +2545,7 @@ def _linux_wwns():
     for fcfile in glob.glob('/sys/class/fc_host/*/port_name'):
         with salt.utils.files.fopen(fcfile, 'r') as _wwn:
             for line in _wwn:
-                line = line.rstrip()
-                ret.extend([line[2:]])
+                ret.append(line.rstrip()[2:])
     return ret
 
 
@@ -2532,11 +2569,9 @@ def _windows_iqn():
             wmic, namespace, mspath, get))
 
     for line in cmdret['stdout'].splitlines():
-        if line[0].isalpha():
-            continue
-        line = line.rstrip()
-        ret.extend([line])
-
+        if line.startswith('iqn.'):
+            line = line.rstrip()
+            ret.append(line.rstrip())
     return ret
 
 
@@ -2544,14 +2579,13 @@ def _windows_wwns():
     '''
     Return Fibre Channel port WWNs from a Windows host.
     '''
-    ps_cmd = r'Get-WmiObject -class MSFC_FibrePortHBAAttributes -namespace "root\WMI" | Select -Expandproperty Attributes | %{($_.PortWWN | % {"{0:x2}" -f $_}) -join ""}'
+    ps_cmd = r'Get-WmiObject -ErrorAction Stop -class MSFC_FibrePortHBAAttributes -namespace "root\WMI" | Select -Expandproperty Attributes | %{($_.PortWWN | % {"{0:x2}" -f $_}) -join ""}'
 
     ret = []
 
     cmdret = __salt__['cmd.run_ps'](ps_cmd)
 
     for line in cmdret:
-        line = line.rstrip()
-        ret.append(line)
+        ret.append(line.rstrip())
 
     return ret
